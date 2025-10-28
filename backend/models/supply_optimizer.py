@@ -207,6 +207,9 @@ class SupplyOptimizer:
             route["distance"] = route_distance
             route["load"] = route_load
             
+            # Calculate duration for this route (assuming 50 km/h average speed)
+            route["duration"] = (route_distance / 1000) / 50 * 60  # minutes
+            
             if len(route["stops"]) > 2:  # Has actual deliveries
                 routes.append(route)
                 total_distance += route_distance

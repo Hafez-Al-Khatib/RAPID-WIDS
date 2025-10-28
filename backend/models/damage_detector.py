@@ -3,7 +3,7 @@ from ultralytics import YOLO
 import cv2
 import numpy as np
 from PIL import Image
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 import os
 
 
@@ -22,10 +22,10 @@ class DamageDetector:
     }
     
     SEVERITY_DESCRIPTIONS = {
-        0: "No visible damage detected",
-        1: "Minor damage: Superficial damage, windows broken",
-        2: "Major damage: Partial roof collapse, major structural issues",
-        3: "Destroyed: Complete structural collapse",
+        0: "No damaged vehicles detected",
+        1: "Minor damage: Few damaged/displaced vehicles",
+        2: "Major damage: Multiple damaged/overturned vehicles",
+        3: "Severe destruction: Many destroyed vehicles, debris field",
         4: "Unable to classify damage level"
     }
     
@@ -40,6 +40,17 @@ class DamageDetector:
         self.confidence_threshold = confidence_threshold
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
+        # COCO class IDs for vehicles
+        self.VEHICLE_CLASSES = {
+            2: 'car',
+            3: 'motorcycle', 
+            5: 'bus',
+            7: 'truck'
+        }
+        
+        # Focus on cars primarily (class 2)
+        self.TARGET_CLASS = 2  # Car
+        
         # Use pretrained YOLOv8 or custom weights
         if model_path and os.path.exists(model_path):
             self.model = YOLO(model_path)
@@ -47,11 +58,22 @@ class DamageDetector:
             # Use YOLOv8n as base model for demo
             self.model = YOLO('yolov8n.pt')
         
+        # Initialize Gemini analyzer (optional)
+        try:
+            from models.gemini_analyzer import get_gemini_analyzer
+            self.gemini = get_gemini_analyzer()
+        except ImportError:
+            self.gemini = None
+            print("⚠️  Gemini analyzer not available")
+        
         print(f"✅ DamageDetector initialized on {self.device}")
+        print(f"🚗 Focusing on vehicle detection (cars)")
+        if self.gemini and self.gemini.model:
+            print(f"🤖 Gemini VLM analysis enabled")
     
     def detect_damage(self, image_path: str) -> Dict:
         """
-        Detect and classify damage in an image.
+        Detect and classify damage in an image using YOLO + optional Gemini VLM.
         
         Args:
             image_path: Path to image file
@@ -59,45 +81,96 @@ class DamageDetector:
         Returns:
             Dictionary with damage classification results
         """
-        # Run inference
+        # Run YOLO inference for car counting
         results = self.model(image_path, conf=self.confidence_threshold)
         
-        # Parse results
-        damage_severity = self._calculate_severity(results)
-        confidence = self._calculate_confidence(results)
+        # Parse YOLO results
+        yolo_severity = self._calculate_severity(results)
+        yolo_confidence = self._calculate_confidence(results)
         bounding_boxes = self._extract_boxes(results)
         
-        return {
-            "damage_class": self.DAMAGE_CLASSES.get(damage_severity, "un-classified"),
-            "severity": damage_severity,
-            "confidence": confidence,
-            "bounding_boxes": bounding_boxes,
-            "description": self.SEVERITY_DESCRIPTIONS.get(damage_severity, "Unknown")
-        }
+        # Try Gemini VLM analysis if available
+        gemini_result = None
+        if self.gemini and self.gemini.model:
+            gemini_result = self.gemini.analyze_disaster_image(image_path)
+        
+        # Combine results (prefer Gemini if available, otherwise use YOLO)
+        if gemini_result and gemini_result.get('available'):
+            # Use Gemini's analysis as primary
+            final_severity = gemini_result.get('severity', yolo_severity)
+            final_confidence = gemini_result.get('confidence', yolo_confidence)
+            description = gemini_result.get('description', self.SEVERITY_DESCRIPTIONS.get(final_severity, "Unknown"))
+            
+            return {
+                "damage_class": self.DAMAGE_CLASSES.get(final_severity, "un-classified"),
+                "severity": final_severity,
+                "confidence": final_confidence,
+                "bounding_boxes": bounding_boxes,
+                "description": description,
+                "gemini_analysis": {
+                    "indicators": gemini_result.get('indicators', []),
+                    "recommendations": gemini_result.get('recommendations', ''),
+                    "raw_response": gemini_result.get('raw_response', '')
+                },
+                "yolo_analysis": {
+                    "severity": yolo_severity,
+                    "confidence": yolo_confidence,
+                    "car_count": len(bounding_boxes)
+                },
+                "analysis_method": "gemini_vlm"
+            }
+        else:
+            # Fallback to YOLO-only analysis
+            return {
+                "damage_class": self.DAMAGE_CLASSES.get(yolo_severity, "un-classified"),
+                "severity": yolo_severity,
+                "confidence": yolo_confidence,
+                "bounding_boxes": bounding_boxes,
+                "description": self.SEVERITY_DESCRIPTIONS.get(yolo_severity, "Unknown"),
+                "yolo_analysis": {
+                    "car_count": len(bounding_boxes)
+                },
+                "analysis_method": "yolo_only"
+            }
     
     def _calculate_severity(self, results) -> int:
         """
-        Calculate overall damage severity from detection results.
-        Uses heuristics based on detection count and confidence.
+        Calculate damage severity based on vehicle detections.
+        
+        Logic:
+        - No detections at all (including cars) = No damage (clean scene)
+        - Few cars detected normally = No damage (normal traffic)
+        - Many cars detected = Higher severity (more people affected)
+        
+        NOTE: This uses COCO-trained YOLO to detect cars as damage proxy.
+        For production, use xBD-trained model.
         """
         if len(results) == 0 or len(results[0].boxes) == 0:
-            return 0  # No damage detected
+            # Nothing detected at all - clean scene
+            return 0  # No damage
         
         boxes = results[0].boxes
-        num_detections = len(boxes)
-        avg_confidence = float(boxes.conf.mean()) if len(boxes.conf) > 0 else 0.0
+        classes = boxes.cls.cpu().numpy() if len(boxes.cls) > 0 else []
         
-        # Heuristic damage classification
-        # In production, this would use trained classification head
-        if num_detections > 10 and avg_confidence > 0.7:
-            return 3  # Destroyed
-        elif num_detections > 5 and avg_confidence > 0.6:
+        # Filter for cars only (class 2)
+        car_detections = sum(1 for cls in classes if int(cls) == self.TARGET_CLASS)
+        
+        # Calculate severity based on car count
+        # For disaster imagery, many cars = many people affected
+        if car_detections == 0:
+            # Detections exist but no cars - unclear scene
+            return 0  # No damage
+        elif car_detections >= 10:
+            # Very many cars - major disaster impact
+            return 3  # Severe destruction (many people affected)
+        elif car_detections >= 6:
+            # Many cars - significant impact
             return 2  # Major damage
-        elif num_detections > 2 and avg_confidence > 0.5:
-            return 1  # Minor damage
-        elif num_detections > 0:
+        elif car_detections >= 3:
+            # Several cars - moderate impact
             return 1  # Minor damage
         else:
+            # 1-2 cars - normal/minimal
             return 0  # No damage
     
     def _calculate_confidence(self, results) -> float:
@@ -109,25 +182,28 @@ class DamageDetector:
         return float(boxes.conf.mean()) if len(boxes.conf) > 0 else 0.0
     
     def _extract_boxes(self, results) -> List[Dict]:
-        """Extract bounding boxes with class and confidence"""
-        bounding_boxes = []
+        """Extract bounding box information from YOLO results (cars only)"""
+        boxes_list = []
         
-        if len(results) == 0:
-            return bounding_boxes
+        if len(results) == 0 or len(results[0].boxes) == 0:
+            return boxes_list
         
         boxes = results[0].boxes
-        
         for box in boxes:
-            bounding_boxes.append({
-                "x1": float(box.xyxy[0][0]),
-                "y1": float(box.xyxy[0][1]),
-                "x2": float(box.xyxy[0][2]),
-                "y2": float(box.xyxy[0][3]),
-                "confidence": float(box.conf[0]),
-                "class": int(box.cls[0]) if len(box.cls) > 0 else 0
-            })
+            cls = int(box.cls)
+            # Only include cars (class 2)
+            if cls == self.TARGET_CLASS:
+                boxes_list.append({
+                    "x1": float(box.xyxy[0][0]),
+                    "y1": float(box.xyxy[0][1]),
+                    "x2": float(box.xyxy[0][2]),
+                    "y2": float(box.xyxy[0][3]),
+                    "confidence": float(box.conf),
+                    "class": cls,
+                    "class_name": "car"
+                })
         
-        return bounding_boxes
+        return boxes_list
     
     def detect_from_bytes(self, image_bytes: bytes) -> Dict:
         """

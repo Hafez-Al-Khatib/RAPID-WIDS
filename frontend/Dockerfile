@@ -12,6 +12,9 @@ RUN npm install --legacy-peer-deps --fetch-timeout=600000 && \
 # Copy application code
 COPY . .
 
+# Set API URL at build time
+ENV REACT_APP_API_URL=http://localhost:8000
+
 # Expose port
 EXPOSE 3000
 

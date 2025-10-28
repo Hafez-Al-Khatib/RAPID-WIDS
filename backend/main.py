@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from geoalchemy2.elements import WKTElement
+from geoalchemy2.shape import to_shape
 from typing import List, Optional
 import os
 import shutil
@@ -119,6 +120,11 @@ async def upload_disaster_photo(
     db.commit()
     db.refresh(report)
     
+    # Convert geometry to WKT string for response
+    if report.location:
+        geom = to_shape(report.location)
+        report.location = geom.wkt
+    
     return report
 
 
@@ -158,6 +164,13 @@ async def get_damage_reports(
         query = query.filter(DamageReport.damage_severity >= min_severity)
     
     reports = query.order_by(DamageReport.timestamp.desc()).offset(skip).limit(limit).all()
+    
+    # Convert geometries to WKT strings for response
+    for report in reports:
+        if report.location:
+            geom = to_shape(report.location)
+            report.location = geom.wkt
+    
     return reports
 
 
@@ -204,6 +217,13 @@ async def get_supply_points(
         query = query.filter(SupplyPoint.type == type)
     
     points = query.all()
+    
+    # Convert geometries to WKT strings for response
+    for point in points:
+        if point.location:
+            geom = to_shape(point.location)
+            point.location = geom.wkt
+    
     return points
 
 
